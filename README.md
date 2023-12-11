@@ -131,7 +131,7 @@ EOF
 
 Change the above IP to the internal IPs of Kubernetes master and workers created in Step 1
 
-## Step 5 - Install **[amazon-eks-pod-identity-webhook](https://github.com/aws/amazon-eks-pod-identity-webhook/tree/master) (not used in this testing)**
+## Step 5 - Install **[amazon-eks-pod-identity-webhook](https://github.com/aws/amazon-eks-pod-identity-webhook/tree/master)**
 
 First install cert-manager
 
