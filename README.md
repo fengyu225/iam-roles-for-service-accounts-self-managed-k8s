@@ -26,19 +26,14 @@ ssh-keygen -e -m PKCS8 -f $PUB_KEY > $PKCS_KEY
 ```
 
 ## Step 3 - Create public issuer for service account tokens
+In this example we use nginx to host the issuer
 
 ```shell
 # Set environment variables for the region and bucket name
 export AWS_REGION=us-east-1
-export S3_BUCKET=oidc-test-$(cat /dev/random | LC_ALL=C tr -dc "[:lower:][:digit:]" | head -c 16)
-# In this example the S3 bucket created is: oidc-test-icch7v3e3ckfzkwe
-
-# Create the S3 bucket
-aws s3api create-bucket --bucket $S3_BUCKET --region $AWS_REGION
 
 # Set the hostname for the issuer
-export HOSTNAME=s3.$AWS_REGION.amazonaws.com
-export ISSUER_HOSTPATH=$HOSTNAME/$S3_BUCKET
+export ISSUER_HOSTPATH=k8s-idp.yufeng.live
 
 # Create the OIDC discovery and keys documents
 cat <<EOF > discovery.json
@@ -65,19 +60,51 @@ go run ./hack/self-hosted/main.go -key $PKCS_KEY | jq '.keys += [.keys[0]] | .ke
 ```
 
 ```shell
-# Upload to S3
-aws s3 cp ./discovery.json s3://$S3_BUCKET/.well-known/openid-configuration
-aws s3 cp ./keys.json s3://$S3_BUCKET/keys.json
+cat << EOF > /etc/nginx/sites-enabled/idp.conf
+server {
+    listen 9999;
 
-# make sure the discovery document and keys.json is public accessible
+    # Health endpoint returning HTTP 200
+    location /health {
+        add_header Content-Type text/plain;
+        return 200 'OK';
+    }
 
-curl -L https://s3.us-east-1.amazonaws.com/oidc-test-icch7v3e3ckfzkwe/.well-known/openid-configuration
-curl -L https://s3.us-east-1.amazonaws.com/oidc-test-icch7v3e3ckfzkwe/keys.json
+    # Endpoint for .well-known/openid-configuration
+    location /.well-known/openid-configuration {
+        default_type application/json;
+        alias /home/ubuntu/discovery.json;
+    }
+
+    # Endpoint for keys.json
+    location /keys.json {
+        default_type application/json;
+        alias /home/ubuntu/keys.json;
+    }
+}
+EOF
+
+# make sure /home/ubuntu/keys.json and /home/ubuntu/discovery.json exist and are readable by nginx
+```
+
+```shell
+sudo systemctl restart nginx
 ```
 
 ## Step 4 - Create Kubernetes cluster
 
 In this example we use kubekey to create Kubernetes cluster
+
+```shell
+sudo passwd ubuntu # set password 0000 for user ubuntu
+sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+sudo systemctl restart sshd
+```
+
+Install Kubekey
+```shell
+curl -sfL https://get-kk.kubesphere.io | VERSION=v2.0.0 sh -
+```
 
 ```shell
 mkdir -p /etc/kubernetes/pki
@@ -111,7 +138,7 @@ spec:
     clusterName: cluster.local
     apiServerArgs:
       - api-audiences=api
-      - service-account-issuer=https://s3.us-east-1.amazonaws.com/oidc-test-icch7v3e3ckfzkwe
+      - service-account-issuer=https://k8s-idp.yufeng.live
   network:
     plugin: calico
     kubePodsCIDR: 10.233.64.0/18
@@ -172,23 +199,23 @@ metadata:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: awscli-irsa-config
+  name: awscli-irsa-config-custom-idp
   namespace: test-irsa
 data:
   AWS_DEFAULT_REGION: us-east-1
-  AWS_ROLE_ARN: arn:aws:iam::072422391281:role/irsa_role
+  AWS_ROLE_ARN: arn:aws:iam::072422391281:role/irsa_role_custom_idp
   AWS_WEB_IDENTITY_TOKEN_FILE: /var/run/secrets/oidc-iam/serviceaccount/token
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: awscli-sa
+  name: awscli-sa-custom-idp
   namespace: test-irsa
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: awscli
+  name: awscli-custom-idp
   namespace: test-irsa
 spec:
   containers:
@@ -198,13 +225,13 @@ spec:
       args: ["360000"]
       envFrom:
         - configMapRef:
-            name: awscli-irsa-config
+            name: awscli-irsa-config-custom-idp
       volumeMounts:
         - mountPath: /var/run/secrets/oidc-iam/serviceaccount/
-          name: aws-token
-  serviceAccountName: awscli-sa
+          name: aws-token-custom-idp
+  serviceAccountName: awscli-sa-custom-idp
   volumes:
-    - name: aws-token
+    - name: aws-token-custom-idp
       projected:
         sources:
           - serviceAccountToken:
@@ -231,10 +258,10 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: awscli-sa
+  name: awscli-sa-custom-idp
   namespace: test-irsa
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::072422391281:role/irsa_role"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::072422391281:role/irsa_role_custom_idp"
     eks.amazonaws.com/audience: "api"
     eks.amazonaws.com/sts-regional-endpoints: "true"
     eks.amazonaws.com/token-expiration: "600"
@@ -242,7 +269,7 @@ metadata:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: awscli
+  name: awscli-custom-idp
   namespace: test-irsa
 spec:
   containers:
@@ -250,7 +277,7 @@ spec:
       name: awscli
       command: ["sleep"]
       args: ["360000"]
-  serviceAccountName: awscli-sa
+  serviceAccountName: awscli-sa-custom-idp
 EOF
 ```
 
@@ -258,22 +285,22 @@ More details about the pod created using option 2
 
 ```shell
 ubuntu@node1:~$ kubectl describe pod -n test-irsa awscli
-Name:         awscli
+Name:         awscli-custom-idp
 Namespace:    test-irsa
 Priority:     0
-Node:         node2/192.168.0.216
-Start Time:   Mon, 11 Dec 2023 08:19:23 +0000
+Node:         node2/192.168.0.22
+Start Time:   Tue, 12 Dec 2023 19:15:02 +0000
 Labels:       <none>
-Annotations:  cni.projectcalico.org/containerID: 667f4efda03e8fe9d0de032d739aac3b7d36fb800ad047d5ae272337859ffb0f
-              cni.projectcalico.org/podIP: 10.233.96.9/32
-              cni.projectcalico.org/podIPs: 10.233.96.9/32
+Annotations:  cni.projectcalico.org/containerID: 179bf403ef5e48a11e05d2a2f6f45b7c560b881e960512131a9a58016fd9e606
+              cni.projectcalico.org/podIP: 10.233.96.6/32
+              cni.projectcalico.org/podIPs: 10.233.96.6/32
 Status:       Running
-IP:           10.233.96.9
+IP:           10.233.96.6
 IPs:
-  IP:  10.233.96.9
+  IP:  10.233.96.6
 Containers:
   awscli:
-    Container ID:  docker://91c7683307b8fecc421327b767100e07d8a899817607261ba3457483ded5923c
+    Container ID:  docker://df967431fa0fb1562374498585259711093112bf4b143e0fc6c381c6a074c08b
     Image:         amazon/aws-cli
     Image ID:      docker-pullable://amazon/aws-cli@sha256:e2a778146a45cb7cdcc55e3051c0de38ea9f180ed88383447f7ead6b0ba5e9a4
     Port:          <none>
@@ -283,16 +310,15 @@ Containers:
     Args:
       360000
     State:          Running
-      Started:      Mon, 11 Dec 2023 08:19:24 +0000
+      Started:      Tue, 12 Dec 2023 19:15:18 +0000
     Ready:          True
     Restart Count:  0
-    Environment:
-      AWS_STS_REGIONAL_ENDPOINTS:   regional
-      AWS_ROLE_ARN:                 arn:aws:iam::072422391281:role/irsa_role
-      AWS_WEB_IDENTITY_TOKEN_FILE:  /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+    Environment Variables from:
+      awscli-irsa-config-custom-idp  ConfigMap  Optional: false
+    Environment:                     <none>
     Mounts:
-      /var/run/secrets/eks.amazonaws.com/serviceaccount from aws-iam-token (ro)
-      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-cwqpd (ro)
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-bp8ln (ro)
+      /var/run/secrets/oidc-iam/serviceaccount/ from aws-token-custom-idp (rw)
 Conditions:
   Type              Status
   Initialized       True
@@ -300,10 +326,10 @@ Conditions:
   ContainersReady   True
   PodScheduled      True
 Volumes:
-  aws-iam-token:
+  aws-token-custom-idp:
     Type:                    Projected (a volume that contains injected data from multiple sources)
-    TokenExpirationSeconds:  3600
-  kube-api-access-cwqpd:
+    TokenExpirationSeconds:  600
+  kube-api-access-bp8ln:
     Type:                    Projected (a volume that contains injected data from multiple sources)
     TokenExpirationSeconds:  3607
     ConfigMapName:           kube-root-ca.crt
@@ -316,11 +342,11 @@ Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists fo
 Events:
   Type    Reason     Age    From               Message
   ----    ------     ----   ----               -------
-  Normal  Scheduled  5m17s  default-scheduler  Successfully assigned test-irsa/awscli to node2
-  Normal  Pulling    5m16s  kubelet            Pulling image "amazon/aws-cli"
-  Normal  Pulled     5m16s  kubelet            Successfully pulled image "amazon/aws-cli" in 136.254977ms
-  Normal  Created    5m16s  kubelet            Created container awscli
-  Normal  Started    5m16s  kubelet            Started container awscli
+  Normal  Scheduled  9m21s  default-scheduler  Successfully assigned test-irsa/awscli-custom-idp to node2
+  Normal  Pulling    9m20s  kubelet            Pulling image "amazon/aws-cli"
+  Normal  Pulled     9m9s   kubelet            Successfully pulled image "amazon/aws-cli" in 11.002877302s
+  Normal  Created    9m5s   kubelet            Created container awscli
+  Normal  Started    9m5s   kubelet            Started container awscli
 ```
 
 example token
@@ -330,21 +356,39 @@ example token
   "aud": [
     "api"
   ],
-  "exp": 1702286363,
-  "iat": 1702282763,
-  "iss": "https://s3.us-east-1.amazonaws.com/oidc-test-icch7v3e3ckfzkwe",
+  "exp": 1702409102,
+  "iat": 1702408502,
+  "iss": "https://k8s-idp.yufeng.live",
   "kubernetes.io": {
     "namespace": "test-irsa",
     "pod": {
-      "name": "awscli",
-      "uid": "48263ea3-527e-4c22-a555-457287077cba"
+      "name": "awscli-custom-idp",
+      "uid": "681e08cb-3525-4f41-8708-6fb618e9996c"
     },
     "serviceaccount": {
-      "name": "awscli-sa",
-      "uid": "07fe2bc3-d597-47c8-a57a-f0f9e1274cce"
+      "name": "awscli-sa-custom-idp",
+      "uid": "6ebf7c83-01d5-4057-8e7a-9ceb821ccbf2"
     }
   },
-  "nbf": 1702282763,
-  "sub": "system:serviceaccount:test-irsa:awscli-sa"
+  "nbf": 1702408502,
+  "sub": "system:serviceaccount:test-irsa:awscli-sa-custom-idp"
 }
+```
+
+## Step 7 - Test
+
+Inside the pod
+```shell
+bash-4.2# aws sts get-caller-identity
+{
+    "UserId": "AROARBXFV7XY6SVWRMB4M:botocore-session-1702408752",
+    "Account": "072422391281",
+    "Arn": "arn:aws:sts::072422391281:assumed-role/irsa_role_custom_idp/botocore-session-1702408752"
+}
+```
+
+Access logs for requests from AWS STS for the OIDC discovery and keys documents
+```shell
+192.168.0.199 - - [12/Dec/2023:19:19:12 +0000] "GET /.well-known/openid-configuration HTTP/1.1" 200 365 "-" "AWS Security Token Service"
+192.168.0.199 - - [12/Dec/2023:19:19:12 +0000] "GET /keys.json HTTP/1.1" 200 996 "-" "AWS Security Token Service"
 ```
